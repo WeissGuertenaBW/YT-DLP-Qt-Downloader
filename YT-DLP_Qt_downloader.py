@@ -2003,7 +2003,7 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.thumbnail_label)
 
         info_panel = QWidget()
-        info_panel.setMaximumWidth(900)
+        # Let the preview text use the empty space on the right instead of wrapping early.
         info_panel.setMinimumWidth(560)
 
         info_layout = QGridLayout(info_panel)
@@ -2013,14 +2013,12 @@ class MainWindow(QMainWindow):
         info_layout.setColumnMinimumWidth(0, 110)
         info_layout.setColumnMinimumWidth(1, 420)
         info_layout.setColumnStretch(0, 0)
-        info_layout.setColumnStretch(1, 1)
+        info_layout.setColumnStretch(1, 10)
 
-        preview_layout.addWidget(info_panel, stretch=0)
-        preview_layout.addStretch(1)
+        preview_layout.addWidget(info_panel, stretch=1)
 
         self.preview_title = QLabel("Analyze a link to preview it here.")
         self.preview_title.setWordWrap(True)
-        self.preview_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #000000;")
 
         self.preview_uploader = QLabel("-")
         self.preview_duration = QLabel("-")
@@ -2028,26 +2026,29 @@ class MainWindow(QMainWindow):
         self.preview_sample_rate = QLabel("-")
         self.preview_size = QLabel("-")
 
-        label_style = "color: #333333; font-weight: bold; font-size: 14px;"
-        value_style = "color: #000000; font-size: 14px;"
-
         uploader_label = QLabel("Uploader:")
         duration_label = QLabel("Duration:")
         resolution_label = QLabel("Resolution:")
         sample_rate_label = QLabel("Sample Rate:")
         size_label = QLabel("Est. Size:")
 
-        for label in [uploader_label, duration_label, resolution_label, sample_rate_label, size_label]:
-            label.setStyleSheet(label_style)
+        self.preview_field_labels = [
+            uploader_label,
+            duration_label,
+            resolution_label,
+            sample_rate_label,
+            size_label,
+        ]
 
-        for value_label in [
+        self.preview_value_labels = [
             self.preview_uploader,
             self.preview_duration,
             self.preview_resolution,
             self.preview_sample_rate,
             self.preview_size,
-        ]:
-            value_label.setStyleSheet(value_style)
+        ]
+
+        self.apply_theme_sensitive_styles()
 
         info_layout.addWidget(self.preview_title, 0, 0, 1, 2)
         info_layout.addWidget(uploader_label, 1, 0, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -2122,6 +2123,10 @@ class MainWindow(QMainWindow):
         self.select_none_button.clicked.connect(self.select_none)
         action_layout.addWidget(self.select_none_button)
 
+        self.remove_selected_button = QPushButton("Remove Selected Jobs")
+        self.remove_selected_button.clicked.connect(self.remove_selected_jobs)
+        action_layout.addWidget(self.remove_selected_button)
+
         action_layout.addStretch()
 
         self.stop_button = QPushButton("Stop All")
@@ -2145,6 +2150,52 @@ class MainWindow(QMainWindow):
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         log_layout.addWidget(self.log_box)
+
+    def is_dark_theme(self) -> bool:
+        palette = QApplication.palette()
+        window_color = palette.color(palette.ColorRole.Window)
+        brightness = (
+            window_color.red() * 0.299
+            + window_color.green() * 0.587
+            + window_color.blue() * 0.114
+        )
+        return brightness < 128
+
+    def apply_theme_sensitive_styles(self) -> None:
+        """
+        Keep preview labels readable in both macOS light mode and dark mode.
+        Avoid hardcoded black text on dark backgrounds.
+        """
+        if self.is_dark_theme():
+            title_color = "#f5f5f5"
+            label_color = "#e7e7e7"
+            value_color = "#ffffff"
+            muted_color = "#d0d0d0"
+        else:
+            title_color = "#000000"
+            label_color = "#333333"
+            value_color = "#000000"
+            muted_color = "#333333"
+
+        self.preview_title.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {title_color};"
+        )
+
+        for label in getattr(self, "preview_field_labels", []):
+            label.setStyleSheet(
+                f"color: {label_color}; font-weight: bold; font-size: 14px;"
+            )
+
+        for label in getattr(self, "preview_value_labels", []):
+            label.setStyleSheet(f"color: {value_color}; font-size: 14px;")
+
+        self.analyze_step_label.setStyleSheet(f"color: {muted_color};")
+        self.status_label.setStyleSheet(f"color: {muted_color};")
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            self.apply_theme_sensitive_styles()
 
     def make_table_item(self, text: str) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
@@ -2211,6 +2262,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.stop_button.setText("Stop All")
         self.resume_button.setEnabled(True)
+        self.remove_selected_button.setEnabled(True)
         self.is_downloading = False
         self.stop_requested_by_user = False
         self.set_status("Ready")
@@ -2652,6 +2704,253 @@ class MainWindow(QMainWindow):
             self.log(msg)
         self.set_status("Ready")
 
+    def selected_job_rows(self) -> List[int]:
+        """
+        For Remove Selected Jobs, "selected" means the app's Select column says Yes,
+        not merely the row highlight. This matches Select All / Select None and the
+        download queue behavior.
+        """
+        return [
+            row for row, item in enumerate(self.items)
+            if getattr(item, "selected", False) and not getattr(item, "is_header", False)
+        ]
+
+    def expected_download_file_for_item(self, item: VideoItem) -> Optional[Path]:
+        """
+        Return the current expected final file path for an item when possible.
+        This is used for removing/renumbering downloaded files.
+        """
+        downloaded_name = (item.downloaded or "").strip()
+        if downloaded_name:
+            folder = Path(self.download_dir_for_item(item)).expanduser()
+            path = folder / downloaded_name
+            if path.exists():
+                return path
+
+        root = Path(self.folder_input.text().strip()).expanduser()
+        if not root:
+            return None
+
+        template = Path(YTDLPHelper.make_output_template(root, item, self.sort_combo.currentText()))
+        folder = template.parent
+        if not folder.exists():
+            return None
+
+        safe_title = YTDLPHelper.safe_filename(item.title)
+        possible_exts = ["mp4", "mkv", "webm", "mov", "avi", "flv", "mp3", "m4a", "wav", "opus", "aac", "flac", "ogg"]
+
+        candidate_names = []
+        if self.sort_combo.currentText() == "Download in order":
+            for ext in possible_exts:
+                candidate_names.append(f"{item.index}. {safe_title}.{ext}")
+        elif self.sort_combo.currentText() == "No order":
+            for ext in possible_exts:
+                candidate_names.append(f"{safe_title}.{ext}")
+
+        for name in candidate_names:
+            candidate = folder / name
+            if candidate.exists():
+                return candidate
+
+        # Last fallback: search for files that contain the title and are not partial fragments.
+        matches = []
+        for path in folder.glob(f"*{safe_title}*"):
+            if path.is_file() and ".part" not in path.name and ".f" not in path.name:
+                matches.append(path)
+
+        if matches:
+            matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return matches[0]
+
+        return None
+
+    def download_dir_for_item(self, item: VideoItem) -> Path:
+        root = Path(self.folder_input.text().strip()).expanduser()
+        channel_title = YTDLPHelper.safe_filename(getattr(item, "channel_title", "") or "")
+        playlist_title = YTDLPHelper.safe_filename(getattr(item, "playlist_title", "") or "")
+
+        folder = root
+        if channel_title:
+            folder = folder / channel_title
+        if playlist_title:
+            folder = folder / playlist_title
+
+        return folder
+
+    def delete_downloaded_files_for_item(self, item: VideoItem) -> List[str]:
+        deleted: List[str] = []
+        final_file = self.expected_download_file_for_item(item)
+
+        candidates: List[Path] = []
+        if final_file:
+            candidates.append(final_file)
+            # Also delete common sidecar files that yt-dlp may create.
+            for sidecar in final_file.parent.glob(final_file.stem + ".*"):
+                if sidecar.is_file():
+                    candidates.append(sidecar)
+
+        # Delete temporary fragments/partials for the same numbered title.
+        folder = self.download_dir_for_item(item)
+        safe_title = YTDLPHelper.safe_filename(item.title)
+        if folder.exists():
+            for path in folder.glob(f"*{safe_title}*"):
+                if path.is_file() and (".part" in path.name or ".f" in path.name):
+                    candidates.append(path)
+
+        seen = set()
+        for path in candidates:
+            try:
+                if path in seen:
+                    continue
+                seen.add(path)
+                if path.exists() and path.is_file():
+                    path.unlink()
+                    deleted.append(str(path))
+            except Exception as exc:
+                self.log(f"Could not delete {path}: {exc}")
+
+        return deleted
+
+    def renumber_items_and_files(self) -> None:
+        """
+        Renumber remaining jobs inside each playlist/group and rename existing
+        downloaded files when filenames use the leading 'N. Title.ext' pattern.
+        """
+        current_group_items: List[VideoItem] = []
+
+        def flush_group(group: List[VideoItem]) -> None:
+            for new_index, item in enumerate(group, start=1):
+                old_index = item.index
+                if old_index == new_index:
+                    continue
+
+                old_file = self.expected_download_file_for_item(item)
+                item.index = new_index
+
+                if not old_file or not old_file.exists():
+                    continue
+
+                # Only rename numbered files. No-order and chronological filenames
+                # should not be changed because their names are not list-number based.
+                if not re.match(r"^\d+\.\s+", old_file.name):
+                    continue
+
+                new_name = re.sub(r"^\d+\.\s+", f"{new_index}. ", old_file.name, count=1)
+                new_file = old_file.with_name(new_name)
+
+                if new_file == old_file:
+                    continue
+
+                try:
+                    if new_file.exists():
+                        self.log(f"Skipped renaming because target already exists: {new_file.name}")
+                        continue
+
+                    old_file.rename(new_file)
+                    item.downloaded = new_file.name
+                    self.log(f"Renamed downloaded file: {old_file.name} → {new_file.name}")
+
+                    # Rename common sidecar files with the same old stem.
+                    for sidecar in old_file.parent.glob(old_file.stem + ".*"):
+                        if not sidecar.exists() or not sidecar.is_file():
+                            continue
+                        sidecar_new = sidecar.with_name(
+                            re.sub(r"^\d+\.\s+", f"{new_index}. ", sidecar.name, count=1)
+                        )
+                        if sidecar_new != sidecar and not sidecar_new.exists():
+                            sidecar.rename(sidecar_new)
+                except Exception as exc:
+                    self.log(f"Could not rename {old_file.name}: {exc}")
+
+        has_headers = any(getattr(item, "is_header", False) for item in self.items)
+
+        if has_headers:
+            for item in self.items:
+                if getattr(item, "is_header", False):
+                    flush_group(current_group_items)
+                    current_group_items = []
+                else:
+                    current_group_items.append(item)
+            flush_group(current_group_items)
+        else:
+            flush_group([item for item in self.items if not getattr(item, "is_header", False)])
+
+    def remove_empty_headers(self) -> None:
+        cleaned: List[VideoItem] = []
+        index = 0
+
+        while index < len(self.items):
+            item = self.items[index]
+            if getattr(item, "is_header", False):
+                next_index = index + 1
+                has_child = False
+                while next_index < len(self.items) and not getattr(self.items[next_index], "is_header", False):
+                    has_child = True
+                    break
+                if has_child:
+                    cleaned.append(item)
+                index += 1
+                continue
+
+            cleaned.append(item)
+            index += 1
+
+        self.items = cleaned
+
+    def remove_selected_jobs(self) -> None:
+        if self.is_downloading:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "Stop the active download first, then remove jobs. This prevents half-written files from being deleted while yt-dlp is still using them.",
+            )
+            return
+
+        rows_to_remove = self.selected_job_rows()
+        if not rows_to_remove:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "No jobs are marked Yes in the Select column. Mark one or more jobs as Yes, then click Remove Selected Jobs.",
+            )
+            return
+
+        jobs = [self.items[row] for row in rows_to_remove]
+        reply = QMessageBox.question(
+            self,
+            APP_TITLE,
+            (
+                f"Remove {len(jobs)} selected job(s)?\n\n"
+                "This will also delete any already-downloaded files for those jobs, "
+                "then renumber the remaining list and numbered downloaded files."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted_count = 0
+        for item in jobs:
+            deleted_files = self.delete_downloaded_files_for_item(item)
+            deleted_count += len(deleted_files)
+
+        remove_ids = {id(item) for item in jobs}
+        self.items = [item for item in self.items if id(item) not in remove_ids]
+
+        self.remove_empty_headers()
+        self.renumber_items_and_files()
+        self.populate_table()
+        self.refresh_preview_after_list_change()
+
+        self.log(f"Removed {len(jobs)} job(s), deleted {deleted_count} file(s), and renumbered remaining jobs.")
+        QMessageBox.information(
+            self,
+            APP_TITLE,
+            f"Removed {len(jobs)} job(s).\nDeleted {deleted_count} file(s).\nRenumbered remaining jobs.",
+        )
+
     def download_selected(self) -> None:
         selected_with_rows = [
             (table_row, item)
@@ -2714,6 +3013,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.stop_button.setText("Stop All")
         self.resume_button.setEnabled(False)
+        self.remove_selected_button.setEnabled(False)
 
         self.download_worker = DownloadWorker(
             items=selected_items,
@@ -2763,6 +3063,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setText("Stop All")
         self.stop_button.setEnabled(True)
         self.resume_button.setEnabled(True)
+        self.remove_selected_button.setEnabled(True)
         self.set_status("Ready")
 
         self.show_download_summary_popup()
@@ -2845,6 +3146,7 @@ class MainWindow(QMainWindow):
         self.download_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.resume_button.setEnabled(False)
+        self.remove_selected_button.setEnabled(False)
         self.clear_button.setEnabled(False)
         self.update_button.setEnabled(False)
 
